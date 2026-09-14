@@ -4,7 +4,8 @@ import os
 import json
 import gzip
 import threading
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote
 
@@ -36,6 +37,9 @@ TOKEN = os.getenv(
     "UPSTOX_ACCESS_TOKEN",
     ""
 ).strip()
+
+# Indian Standard Time
+IST = ZoneInfo("Asia/Kolkata")
 
 # Minimum share price
 MIN_PRICE = 100.0
@@ -1341,6 +1345,18 @@ def candle_time_label(
             )
         )
 
+        # Convert Upstox UTC candle time
+        # to Indian Standard Time.
+        if dt.tzinfo is None:
+
+            dt = dt.replace(
+                tzinfo=timezone.utc
+            )
+
+        dt = dt.astimezone(
+            IST
+        )
+
         end = (
 
             dt
@@ -1839,9 +1855,15 @@ def perform_scan():
                 "Actual"
         })
 
+    # ========================================================
+    # SCAN COMPLETE TIME — INDIA / IST
+    # ========================================================
+
     LAST_SCAN_TIME = (
 
-        datetime.now().strftime(
+        datetime.now(
+            IST
+        ).strftime(
             "%Y-%m-%d %H:%M:%S"
         )
     )
