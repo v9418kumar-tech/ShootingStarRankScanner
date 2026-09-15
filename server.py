@@ -3,29 +3,45 @@ import requests
 import os
 import json
 import gzip
+import io
+import csv
+import zipfile
 import threading
+import time
 from datetime import datetime, timedelta, date, timezone
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote
 
+
 app = Flask(__name__)
+
 
 # ============================================================
 # SHOOTING STAR RANK SCANNER
 # ============================================================
+#
 # 5-Minute NSE Equity Scanner
 #
 # DEVELOPING:
-# Current 5-minute candle, live quality score.
+# Current 5-minute candle की live structure.
 #
 # ACTUAL:
-# Latest completed 5-minute candle which satisfies
-# the Shooting Star structure.
+# आज की completed 5-minute candles में
+# Shooting Star structure.
 #
 # IMPORTANT:
-# Developing and Actual are ranked separately.
-# Confirmation candle is NOT required for Actual.
+# आज की पुरानी completed candles भी scan होंगी।
+# इसलिए सुबह बना Shooting Star बाद में भी दिखाई दे सकता है।
+#
+# Liquidity:
+# 20-Day Average Turnover >= ₹5 Crore
+#
+# Price:
+# >= ₹100
+#
+# Universe:
+# NSE EQ only
 # ============================================================
 
 
@@ -38,29 +54,66 @@ TOKEN = os.getenv(
     ""
 ).strip()
 
-# Indian Standard Time
-IST = ZoneInfo("Asia/Kolkata")
+
+IST = ZoneInfo(
+    "Asia/Kolkata"
+)
+
 
 # Minimum share price
 MIN_PRICE = 100.0
 
-# Minimum 20-day average turnover
-# ₹10 crore
-MIN_AVG_TURNOVER = 100_000_000.0
 
-# Minimum score shown in scanner
+# ------------------------------------------------------------
+# LIQUIDITY SAFETY
+# ------------------------------------------------------------
+#
+# पहले ₹10 Crore था।
+# अब ₹5 Crore रखा गया है।
+#
+# इससे बहुत छोटे/कम कारोबार वाले shares बाहर रहेंगे,
+# लेकिन ₹10 Cr से ₹5 Cr के बीच वाले अच्छे shares
+# भी scanner में आ सकेंगे।
+# ------------------------------------------------------------
+
+MIN_AVG_TURNOVER = 50_000_000.0
+
+
+# Minimum Shooting Star score
 MIN_SCORE = 60.0
 
-# Number of intraday candidates processed.
-# This keeps the first version fast and within API limits.
-MAX_INTRADAY_STOCKS = 450
 
-# Parallel candle requests
+# ------------------------------------------------------------
+# API SAFETY
+# ------------------------------------------------------------
+#
+# Upstox standard APIs की 500 requests/min limit के अंदर
+# रहने के लिए एक scan में लगभग 450 candle requests रखे गए हैं।
+#
+# बाकी requests:
+# - quote batches
+# - NSE turnover files
+#
+# अगले scan में अगला 450-stock block लिया जाएगा।
+# ------------------------------------------------------------
+
+CANDLE_BATCH_SIZE = 450
+
+
 MAX_CANDLE_WORKERS = 20
 
 
+# Scan interval
+SCAN_INTERVAL_SECONDS = 65
+
+
+# Display limits
+MAX_ACTUAL_DISPLAY = 200
+MAX_DEVELOPING_DISPLAY = 100
+
+
 # ============================================================
-# UPSTOX URLs
+# UPSTOX URLS
 # ============================================================
 
 INSTRUMENT_URL = (
@@ -68,18 +121,34 @@ INSTRUMENT_URL = (
     "instruments/exchange/complete.json.gz"
 )
 
+
 QUOTE_URL = (
     "https://api.upstox.com/v3/market-quote/quotes"
 )
+
 
 INTRADAY_URL = (
     "https://api.upstox.com/v3/historical-candle/"
     "intraday/{key}/minutes/5"
 )
 
+
+# ============================================================
+# CURRENT NSE UDiFF BHAVCOPY
+# ============================================================
+#
+# NSE के पुराने Bhavcopy formats जुलाई 2024 में
+# discontinue हो चुके हैं।
+#
+# Current UDiFF direct file format:
+#
+# BhavCopy_NSE_CM_0_0_0_YYYYMMDD_F_0000.csv.zip
+#
+# ============================================================
+
 NSE_BHAV_URL = (
-    "https://nsearchives.nseindia.com/products/"
-    "content/sec_bhavdata_full_{}.csv"
+    "https://nsearchives.nseindia.com/content/cm/"
+    "BhavCopy_NSE_CM_0_0_0_{date}_F_0000.csv.zip"
 )
 
 
@@ -102,18 +171,33 @@ INSTRUMENT_MAP = {}
 
 AVG_TURNOVER = {}
 
+
 LIVE_RESULTS = {
+
     "developing": [],
+
     "actual": []
 }
 
+
+# आज के सभी discovered Actual signals
+# key = SYMBOL|CANDLE_TIMESTAMP
+TODAY_ACTUAL_SIGNALS = {}
+
+
 SCAN_RUNNING = False
+
+BACKGROUND_RUNNING = False
 
 LAST_SCAN_TIME = ""
 
 LAST_ERROR = ""
 
+LAST_BATCH_INFO = ""
+
 SCAN_LOCK = threading.Lock()
+
+BATCH_INDEX = 0
 
 
 # ============================================================
@@ -123,6 +207,7 @@ SCAN_LOCK = threading.Lock()
 def headers():
 
     return {
+
         "Accept":
             "application/json",
 
@@ -130,14 +215,17 @@ def headers():
             "application/json",
 
         "Authorization":
-            f"Bearer {TOKEN}",
+            "Bearer " + TOKEN,
 
         "User-Agent":
-            "ShootingStarRankScanner/1.0"
+            "ShootingStarRankScanner/Final"
     }
 
 
-def chunks(items, size):
+def chunks(
+    items,
+    size
+):
 
     for i in range(
         0,
@@ -150,14 +238,69 @@ def chunks(items, size):
         ]
 
 
-def clamp(value):
+def clamp(
+    value
+):
+
+    try:
+
+        value = float(
+            value
+        )
+
+    except Exception:
+
+        value = 0.0
 
     return max(
         0.0,
         min(
             100.0,
-            float(value)
+            value
         )
+    )
+
+
+def safe_float(
+    value,
+    default=0.0
+):
+
+    try:
+
+        return float(
+            value
+        )
+
+    except Exception:
+
+        return default
+
+
+# ============================================================
+# MARKET TIME
+# ============================================================
+
+def market_open_now():
+
+    now = datetime.now(
+        IST
+    )
+
+    t = now.time()
+
+    return (
+        t >= datetime.strptime(
+            "09:15",
+            "%H:%M"
+        ).time()
+
+        and
+
+        t <= datetime.strptime(
+            "15:35",
+            "%H:%M"
+        ).time()
     )
 
 
@@ -168,32 +311,45 @@ def clamp(value):
 def load_instruments():
 
     global INSTRUMENTS
+
     global INSTRUMENT_MAP
+
 
     if INSTRUMENTS:
 
         return INSTRUMENTS
 
+
     print(
         "Loading NSE EQ instruments..."
     )
 
+
     r = requests.get(
+
         INSTRUMENT_URL,
+
         timeout=30
     )
 
+
     r.raise_for_status()
+
 
     raw = gzip.decompress(
         r.content
     )
 
+
     data = json.loads(
-        raw.decode("utf-8")
+        raw.decode(
+            "utf-8"
+        )
     )
 
+
     instruments = []
+
 
     for x in data:
 
@@ -201,7 +357,9 @@ def load_instruments():
             x,
             dict
         ):
+
             continue
+
 
         if x.get(
             "segment"
@@ -209,29 +367,37 @@ def load_instruments():
 
             continue
 
+
         if x.get(
             "instrument_type"
         ) != "EQ":
 
             continue
 
+
         key = x.get(
             "instrument_key"
         )
 
+
         symbol = (
+
             x.get(
                 "trading_symbol"
             )
+
             or
+
             x.get(
                 "short_name"
             )
         )
 
+
         if not key or not symbol:
 
             continue
+
 
         instruments.append({
 
@@ -248,7 +414,16 @@ def load_instruments():
                 )
         })
 
+
+    instruments.sort(
+
+        key=lambda x:
+            x["symbol"]
+    )
+
+
     INSTRUMENTS = instruments
+
 
     INSTRUMENT_MAP = {
 
@@ -259,11 +434,13 @@ def load_instruments():
         for x in instruments
     }
 
+
     print(
-        f"Loaded "
-        f"{len(INSTRUMENTS)} "
-        f"NSE EQ instruments"
+        "Loaded",
+        len(INSTRUMENTS),
+        "NSE EQ instruments"
     )
+
 
     return INSTRUMENTS
 
@@ -272,7 +449,9 @@ def load_instruments():
 # LIVE QUOTES
 # ============================================================
 
-def fetch_quote_batch(batch):
+def fetch_quote_batch(
+    batch
+):
 
     keys = ",".join(
 
@@ -283,6 +462,7 @@ def fetch_quote_batch(batch):
         for x in batch
     )
 
+
     try:
 
         r = requests.get(
@@ -292,6 +472,7 @@ def fetch_quote_batch(batch):
             headers=headers(),
 
             params={
+
                 "instrument_key":
                     keys
             },
@@ -299,22 +480,28 @@ def fetch_quote_batch(batch):
             timeout=15
         )
 
+
         if r.status_code != 200:
 
             print(
                 "Quote error:",
-                r.status_code,
-                r.text[:200]
+                r.status_code
             )
 
             return []
 
-        data = r.json().get(
-            "data",
-            {}
+
+        data = (
+            r.json()
+            .get(
+                "data",
+                {}
+            )
         )
 
+
         results = []
+
 
         for response_key, q in data.items():
 
@@ -325,6 +512,7 @@ def fetch_quote_batch(batch):
 
                 continue
 
+
             instrument_key = (
 
                 q.get(
@@ -333,45 +521,54 @@ def fetch_quote_batch(batch):
 
                 or
 
-                response_key
+                response_key.replace(
+                    ":",
+                    "|",
+                    1
+                )
             )
+
 
             info = INSTRUMENT_MAP.get(
                 instrument_key
             )
 
+
             if not info:
 
                 continue
 
-            price = float(
+
+            price = safe_float(
                 q.get(
                     "last_price"
                 )
-                or 0
             )
 
-            previous_close = float(
+
+            previous_close = safe_float(
                 q.get(
                     "prev_close_price"
                 )
-                or 0
             )
 
-            volume = float(
+
+            volume = safe_float(
                 q.get(
                     "volume"
                 )
-                or 0
             )
+
 
             if price < MIN_PRICE:
 
                 continue
 
+
             if previous_close <= 0:
 
                 continue
+
 
             results.append({
 
@@ -394,7 +591,9 @@ def fetch_quote_batch(batch):
                     volume
             })
 
+
         return results
+
 
     except Exception as e:
 
@@ -410,6 +609,7 @@ def fetch_all_live_quotes():
 
     load_instruments()
 
+
     batches = list(
         chunks(
             INSTRUMENTS,
@@ -417,11 +617,9 @@ def fetch_all_live_quotes():
         )
     )
 
-    if not batches:
-
-        return []
 
     results = []
+
 
     with ThreadPoolExecutor(
 
@@ -432,15 +630,19 @@ def fetch_all_live_quotes():
 
     ) as executor:
 
+
         futures = [
 
             executor.submit(
+
                 fetch_quote_batch,
+
                 batch
             )
 
             for batch in batches
         ]
+
 
         for future in as_completed(
             futures
@@ -452,17 +654,16 @@ def fetch_all_live_quotes():
                     future.result()
                 )
 
-            except Exception as e:
+            except Exception:
 
-                print(
-                    "Quote worker error:",
-                    repr(e)
-                )
+                pass
+
 
     print(
-        f"Live quotes received: "
-        f"{len(results)}"
+        "Live quotes received:",
+        len(results)
     )
+
 
     return results
 
@@ -475,6 +676,7 @@ def nse_session():
 
     s = requests.Session()
 
+
     s.headers.update({
 
         "User-Agent":
@@ -485,7 +687,7 @@ def nse_session():
 
         "Accept":
             "text/csv,text/plain,"
-            "application/json,*/*",
+            "application/zip,*/*",
 
         "Accept-Language":
             "en-US,en;q=0.9",
@@ -494,10 +696,13 @@ def nse_session():
             "https://www.nseindia.com/"
     })
 
+
     try:
 
         s.get(
+
             "https://www.nseindia.com/",
+
             timeout=8
         )
 
@@ -505,220 +710,399 @@ def nse_session():
 
         pass
 
+
     return s
 
 
 # ============================================================
-# NSE BHAVCOPY
+# NSE UDiFF BHAVCOPY
 # ============================================================
 
-def get_bhavcopy(date_obj):
+def get_bhavcopy(
+    date_obj
+):
 
     try:
 
         date_str = date_obj.strftime(
-            "%d%m%Y"
+            "%Y%m%d"
         )
+
 
         url = NSE_BHAV_URL.format(
-            date_str
+            date=date_str
         )
 
+
         r = nse_session().get(
+
             url,
+
             timeout=20
         )
 
+
         if r.status_code != 200:
 
-            return {}
-
-        if not r.text.strip():
-
-            return {}
-
-        lines = r.text.splitlines()
-
-        if len(lines) < 2:
-
-            return {}
-
-        header = [
-
-            x.strip().upper()
-
-            for x in lines[0].split(",")
-        ]
-
-        index = {
-
-            name: i
-
-            for i, name in enumerate(
-                header
+            print(
+                "NSE bhavcopy HTTP:",
+                r.status_code,
+                date_str
             )
-        }
 
-        required = (
+            return {}
 
-            "SYMBOL",
-            "CLOSE_PRICE",
-            "SERIES"
+
+        if len(r.content) < 500:
+
+            return {}
+
+
+        # ----------------------------------------------------
+        # Current UDiFF is ZIP containing CSV.
+        # ----------------------------------------------------
+
+        raw_csv = None
+
+
+        try:
+
+            with zipfile.ZipFile(
+                io.BytesIO(
+                    r.content
+                )
+            ) as z:
+
+                csv_names = [
+
+                    name
+
+                    for name in z.namelist()
+
+                    if name.lower().endswith(
+                        ".csv"
+                    )
+                ]
+
+
+                if not csv_names:
+
+                    return {}
+
+
+                raw_csv = z.read(
+                    csv_names[0]
+                )
+
+
+        except zipfile.BadZipFile:
+
+            # Some mirrors may return CSV directly.
+            raw_csv = r.content
+
+
+        if not raw_csv:
+
+            return {}
+
+
+        text = raw_csv.decode(
+
+            "utf-8-sig",
+
+            errors="replace"
         )
 
-        if not all(
-            x in index
-            for x in required
-        ):
 
-            return {}
+        reader = csv.DictReader(
 
-        turnover_index = index.get(
-            "TOTTRDVAL"
-        )
-
-        volume_index = (
-            index.get(
-                "TTL_TRD_QNTY"
-            )
-            or
-            index.get(
-                "TOTTRDQTY"
+            io.StringIO(
+                text
             )
         )
+
 
         result = {}
 
-        for line in lines[1:]:
 
-            try:
+        for row in reader:
 
-                parts = [
-
-                    x.strip()
-
-                    for x in line.split(",")
-                ]
-
-                if len(parts) <= max(
-                    index.values()
-                ):
-
-                    continue
-
-                series = (
-
-                    parts[
-                        index["SERIES"]
-                    ]
-                    .upper()
-                )
-
-                if series != "EQ":
-
-                    continue
-
-                symbol = (
-
-                    parts[
-                        index["SYMBOL"]
-                    ]
-                    .upper()
-                    .strip()
-                )
-
-                close = float(
-
-                    parts[
-                        index[
-                            "CLOSE_PRICE"
-                        ]
-                    ]
-                    .replace(
-                        ",",
-                        ""
-                    )
-                )
-
-                if turnover_index is not None:
-
-                    turnover = float(
-
-                        parts[
-                            turnover_index
-                        ]
-                        .replace(
-                            ",",
-                            ""
-                        )
-                    )
-
-                elif volume_index is not None:
-
-                    volume = float(
-
-                        parts[
-                            volume_index
-                        ]
-                        .replace(
-                            ",",
-                            ""
-                        )
-                    )
-
-                    turnover = (
-                        close * volume
-                    )
-
-                else:
-
-                    continue
-
-                if turnover > 0:
-
-                    result[symbol] = turnover
-
-            except Exception:
+            if not row:
 
                 continue
 
+
+            normalized = {
+
+                str(k)
+                .strip()
+                .upper():
+
+                str(v)
+                .strip()
+
+                for k, v in row.items()
+
+                if k is not None
+            }
+
+
+            series = (
+
+                normalized.get(
+                    "SCTY SRS"
+                )
+
+                or
+
+                normalized.get(
+                    "SCTYSRS"
+                )
+
+                or
+
+                normalized.get(
+                    "SERIES"
+                )
+
+                or
+
+                ""
+            ).upper()
+
+
+            if series != "EQ":
+
+                continue
+
+
+            symbol = (
+
+                normalized.get(
+                    "TCKRSYMB"
+                )
+
+                or
+
+                normalized.get(
+                    "TCKR SYMB"
+                )
+
+                or
+
+                normalized.get(
+                    "SYMBOL"
+                )
+
+                or
+
+                ""
+            ).strip().upper()
+
+
+            if not symbol:
+
+                continue
+
+
+            turnover_text = (
+
+                normalized.get(
+                    "TTLTRFVAL"
+                )
+
+                or
+
+                normalized.get(
+                    "TTL TRF VAL"
+                )
+
+                or
+
+                normalized.get(
+                    "TOTTRDVAL"
+                )
+
+                or
+
+                ""
+            )
+
+
+            volume_text = (
+
+                normalized.get(
+                    "TTLTRDG VOL"
+                )
+
+                or
+
+                normalized.get(
+                    "TTLTRDQTY"
+                )
+
+                or
+
+                normalized.get(
+                    "TTL_TRD_QNTY"
+                )
+
+                or
+
+                normalized.get(
+                    "TOTTRDQTY"
+                )
+
+                or
+
+                ""
+            )
+
+
+            close_text = (
+
+                normalized.get(
+                    "CLSPRIC"
+                )
+
+                or
+
+                normalized.get(
+                    "CLS PRIC"
+                )
+
+                or
+
+                normalized.get(
+                    "CLOSE_PRICE"
+                )
+
+                or
+
+                normalized.get(
+                    "CLOSE"
+                )
+
+                or
+
+                ""
+            )
+
+
+            turnover = safe_float(
+
+                turnover_text
+                .replace(
+                    ",",
+                    ""
+                )
+            )
+
+
+            close = safe_float(
+
+                close_text
+                .replace(
+                    ",",
+                    ""
+                )
+            )
+
+
+            volume = safe_float(
+
+                volume_text
+                .replace(
+                    ",",
+                    ""
+                )
+            )
+
+
+            if turnover <= 0:
+
+                if (
+                    close > 0
+                    and
+                    volume > 0
+                ):
+
+                    turnover = (
+                        close
+                        *
+                        volume
+                    )
+
+
+            if turnover > 0:
+
+                result[
+                    symbol
+                ] = turnover
+
+
+        print(
+
+            "NSE turnover:",
+            date_str,
+            len(result)
+        )
+
+
         return result
+
 
     except Exception as e:
 
         print(
+
             "Bhavcopy error:",
             date_obj,
             repr(e)
         )
 
+
         return {}
 
 
 # ============================================================
-# PREVIOUS 20 TRADING DAYS
+# PREVIOUS TRADING DATES
 # ============================================================
 
-def previous_trading_dates():
+def previous_weekdays(
+    max_days=30
+):
 
     dates = []
 
+
     d = (
 
-        datetime.now().date()
+        datetime.now(
+            IST
+        ).date()
+
         -
-        timedelta(days=1)
+
+        timedelta(
+            days=1
+        )
     )
 
-    while len(dates) < 20:
+
+    while len(dates) < max_days:
 
         if d.weekday() < 5:
 
-            dates.append(d)
+            dates.append(
+                d
+            )
+
 
         d -= timedelta(
             days=1
         )
+
 
     return dates
 
@@ -731,23 +1115,35 @@ def load_turnover_cache():
 
     global AVG_TURNOVER
 
+
     try:
 
         with open(
+
             CACHE_FILE,
+
             "r",
+
             encoding="utf-8"
+
         ) as f:
 
-            saved = json.load(f)
+            saved = json.load(
+                f
+            )
+
 
         if (
 
             saved.get(
                 "date"
             )
+
             ==
-            str(date.today())
+
+            str(
+                date.today()
+            )
 
             and
 
@@ -767,17 +1163,25 @@ def load_turnover_cache():
                 ].items()
             }
 
+
             print(
+
                 "20D turnover loaded "
                 "from cache:",
-                len(AVG_TURNOVER)
+
+                len(
+                    AVG_TURNOVER
+                )
             )
 
+
             return True
+
 
     except Exception:
 
         pass
+
 
     return False
 
@@ -788,10 +1192,12 @@ def build_turnover_cache(
 
     global AVG_TURNOVER
 
+
     print(
         "Building 20-day "
         "average turnover..."
     )
+
 
     sums = {
 
@@ -800,6 +1206,7 @@ def build_turnover_cache(
         for s in symbols
     }
 
+
     counts = {
 
         s: 0
@@ -807,29 +1214,53 @@ def build_turnover_cache(
         for s in symbols
     }
 
-    dates = previous_trading_dates()
+
+    dates = previous_weekdays(
+        30
+    )
+
+
+    # Maximum 30 NSE requests.
+    # We stop after 20 successful trading days
+    # have been collected.
+    successful_days = 0
+
 
     with ThreadPoolExecutor(
+
         max_workers=6
+
     ) as executor:
 
-        futures = [
+
+        futures = {
 
             executor.submit(
                 get_bhavcopy,
                 d
-            )
+            ): d
 
             for d in dates
-        ]
+        }
+
 
         for future in as_completed(
             futures
         ):
 
+
             try:
 
                 day = future.result()
+
+
+                if not day:
+
+                    continue
+
+
+                successful_days += 1
+
 
                 for symbol in symbols:
 
@@ -837,50 +1268,75 @@ def build_turnover_cache(
                         symbol
                     )
 
+
                     if turnover is None:
 
                         continue
+
 
                     sums[symbol] += (
                         turnover
                     )
 
+
                     counts[symbol] += 1
+
+
+                if successful_days >= 20:
+
+                    break
+
 
             except Exception:
 
                 pass
 
+
+    # Only symbols having all 20 days.
     AVG_TURNOVER = {
 
         s:
-            sums[s] / 20.0
+
+            sums[s]
+            /
+            20.0
 
         for s in symbols
 
-        if counts[s] == 20
+        if counts[s] >= 20
     }
+
 
     try:
 
         with open(
+
             CACHE_FILE,
+
             "w",
+
             encoding="utf-8"
+
         ) as f:
 
             json.dump(
 
                 {
+
                     "date":
-                        str(date.today()),
+                        str(
+                            date.today()
+                        ),
 
                     "data":
                         AVG_TURNOVER
+
                 },
 
                 f
+
             )
+
 
     except Exception as e:
 
@@ -889,9 +1345,19 @@ def build_turnover_cache(
             repr(e)
         )
 
+
     print(
+
         "20D average turnover calculated:",
-        len(AVG_TURNOVER)
+
+        len(
+            AVG_TURNOVER
+        )
+    )
+
+
+    return len(
+        AVG_TURNOVER
     )
 
 
@@ -905,16 +1371,19 @@ def get_5m_candles(
 
     try:
 
-        # Instrument key can contain
-        # special characters such as "|".
         encoded_key = quote(
+
             instrument_key,
+
             safe=""
         )
 
+
         url = INTRADAY_URL.format(
+
             key=encoded_key
         )
+
 
         r = requests.get(
 
@@ -925,20 +1394,31 @@ def get_5m_candles(
             timeout=12
         )
 
+
         if r.status_code != 200:
 
             return []
 
+
         payload = r.json()
+
 
         candles = (
 
             payload
-            .get("data", {})
-            .get("candles", [])
+            .get(
+                "data",
+                {}
+            )
+            .get(
+                "candles",
+                []
+            )
         )
 
+
         return candles or []
+
 
     except Exception as e:
 
@@ -948,6 +1428,125 @@ def get_5m_candles(
         )
 
         return []
+
+
+# ============================================================
+# CANDLE TIME HELPERS
+# ============================================================
+
+def parse_candle_time(
+    timestamp
+):
+
+    try:
+
+        dt = datetime.fromisoformat(
+
+            str(
+                timestamp
+            ).replace(
+                "Z",
+                "+00:00"
+            )
+        )
+
+
+        if dt.tzinfo is None:
+
+            dt = dt.replace(
+                tzinfo=IST
+            )
+
+
+        return dt.astimezone(
+            IST
+        )
+
+
+    except Exception:
+
+        return None
+
+
+def candle_completed(
+    timestamp,
+    now=None
+):
+
+    dt = parse_candle_time(
+        timestamp
+    )
+
+
+    if not dt:
+
+        return False
+
+
+    if now is None:
+
+        now = datetime.now(
+            IST
+        )
+
+
+    end = (
+
+        dt
+
+        +
+
+        timedelta(
+            minutes=5
+        )
+    )
+
+
+    return end <= now
+
+
+def candle_time_label(
+    timestamp
+):
+
+    dt = parse_candle_time(
+        timestamp
+    )
+
+
+    if not dt:
+
+        return ""
+
+
+    end = (
+
+        dt
+
+        +
+
+        timedelta(
+            minutes=5
+        )
+    )
+
+
+    return (
+
+        dt.strftime(
+            "%H:%M"
+        )
+
+        +
+
+        "–"
+
+        +
+
+        end.strftime(
+            "%H:%M"
+        )
+    )
 
 
 # ============================================================
@@ -961,20 +1560,23 @@ def shooting_star_score(
 
     try:
 
-        # Standard Upstox candle:
-        #
-        # [timestamp, open, high,
-        #  low, close, volume, oi]
-        #
         timestamp = candle[0]
 
-        o = float(candle[1])
+        o = float(
+            candle[1]
+        )
 
-        h = float(candle[2])
+        h = float(
+            candle[2]
+        )
 
-        l = float(candle[3])
+        l = float(
+            candle[3]
+        )
 
-        c = float(candle[4])
+        c = float(
+            candle[4]
+        )
 
     except Exception:
 
@@ -990,55 +1592,68 @@ def shooting_star_score(
                 ""
         }
 
+
     candle_range = max(
+
         h - l,
+
         0.000001
     )
+
 
     body = abs(
         c - o
     )
 
+
     body_safe = max(
 
         body,
 
-        candle_range * 0.02,
+        candle_range
+        *
+        0.02,
 
         0.01
     )
 
+
     upper_wick = (
+
         h
         -
+
         max(
             o,
             c
         )
     )
 
+
     lower_wick = (
+
         min(
             o,
             c
         )
+
         -
+
         l
     )
 
-    # ========================================================
-    # 1. UPPER WICK STRENGTH
-    # Weight = 30
-    #
-    # 2x body = strong
-    # 3x body or more = maximum
-    # ========================================================
+
+    # --------------------------------------------------------
+    # 1. Upper wick
+    # --------------------------------------------------------
 
     upper_ratio = (
+
         upper_wick
         /
         body_safe
     )
+
 
     upper_score = clamp(
 
@@ -1047,23 +1662,26 @@ def shooting_star_score(
             -
             1.0
         )
+
         /
+
         2.0
+
         *
+
         100
     )
 
-    # ========================================================
-    # 2. BODY POSITION
-    # Weight = 20
-    #
-    # Body should be close to bottom.
-    # ========================================================
+
+    # --------------------------------------------------------
+    # 2. Body near bottom
+    # --------------------------------------------------------
 
     body_top = max(
         o,
         c
     )
+
 
     body_position = (
 
@@ -1072,9 +1690,12 @@ def shooting_star_score(
             -
             body_top
         )
+
         /
+
         candle_range
     )
+
 
     body_position_score = clamp(
 
@@ -1085,12 +1706,10 @@ def shooting_star_score(
         100
     )
 
-    # ========================================================
-    # 3. LOWER WICK
-    # Weight = 15
-    #
-    # Smaller lower wick = better.
-    # ========================================================
+
+    # --------------------------------------------------------
+    # 3. Small lower wick
+    # --------------------------------------------------------
 
     lower_ratio = (
 
@@ -1099,23 +1718,28 @@ def shooting_star_score(
         candle_range
     )
 
+
     lower_score = clamp(
 
         (
             1.0
+
             -
+
             lower_ratio
             /
             0.35
         )
+
         *
+
         100
     )
 
-    # ========================================================
-    # 4. CLOSE NEAR LOW
-    # Weight = 15
-    # ========================================================
+
+    # --------------------------------------------------------
+    # 4. Close near low
+    # --------------------------------------------------------
 
     close_from_low = (
 
@@ -1124,75 +1748,96 @@ def shooting_star_score(
             -
             l
         )
+
         /
+
         candle_range
     )
+
 
     close_low_score = clamp(
 
         (
             1.0
+
             -
+
             close_from_low
             /
             0.60
         )
+
         *
+
         100
     )
 
-    # ========================================================
-    # 5. PREVIOUS UPTREND
-    # Weight = 10
-    #
-    # Only completed previous candles are used.
-    # ========================================================
+
+    # --------------------------------------------------------
+    # 5. Previous short-term uptrend
+    # --------------------------------------------------------
 
     uptrend_score = 0.0
+
 
     if len(
         previous_candles
     ) >= 3:
 
-        c1 = float(
-            previous_candles[-3][4]
-        )
 
-        c3 = float(
-            previous_candles[-1][4]
-        )
+        try:
 
-        move = (
-
-            (
-                c3
-                -
-                c1
+            c1 = float(
+                previous_candles[-3][4]
             )
-            /
-            max(
-                c1,
-                0.01
+
+
+            c3 = float(
+                previous_candles[-1][4]
             )
-        ) * 100
 
-        uptrend_score = clamp(
 
-            move
-            /
-            1.0
-            *
-            100
-        )
+            move = (
 
-    # ========================================================
-    # 6. BEARISH / SMALL BODY
-    # Weight = 10
-    # ========================================================
+                (
+                    c3
+                    -
+                    c1
+                )
+
+                /
+
+                max(
+                    c1,
+                    0.01
+                )
+
+            ) * 100
+
+
+            uptrend_score = clamp(
+
+                move
+                /
+                1.0
+                *
+                100
+            )
+
+
+        except Exception:
+
+            uptrend_score = 0.0
+
+
+    # --------------------------------------------------------
+    # 6. Bearish / small body
+    # --------------------------------------------------------
 
     if c < o:
 
         bearish_score = 100.0
+
 
     else:
 
@@ -1203,22 +1848,28 @@ def shooting_star_score(
             candle_range
         )
 
+
         bearish_score = clamp(
 
             (
                 1.0
+
                 -
+
                 body_fraction
                 /
                 0.35
             )
+
             *
+
             100
         )
 
-    # ========================================================
+
+    # --------------------------------------------------------
     # FINAL SCORE
-    # ========================================================
+    # --------------------------------------------------------
 
     final_score = (
 
@@ -1257,13 +1908,10 @@ def shooting_star_score(
         0.10
     )
 
-    # ========================================================
-    # ACTUAL SHOOTING STAR GATE
-    #
-    # These are the structural requirements.
-    #
-    # No next-candle confirmation required.
-    # ========================================================
+
+    # --------------------------------------------------------
+    # ACTUAL SHOOTING STAR STRUCTURE
+    # --------------------------------------------------------
 
     actual = (
 
@@ -1297,7 +1945,9 @@ def shooting_star_score(
 
         (
             c <= o
+
             or
+
             body
             <=
             0.15
@@ -1311,6 +1961,7 @@ def shooting_star_score(
         >=
         30
     )
+
 
     return {
 
@@ -1328,67 +1979,6 @@ def shooting_star_score(
 
 
 # ============================================================
-# CANDLE TIME
-# ============================================================
-
-def candle_time_label(
-    timestamp
-):
-
-    try:
-
-        dt = datetime.fromisoformat(
-
-            timestamp.replace(
-                "Z",
-                "+00:00"
-            )
-        )
-
-        # Convert Upstox UTC candle time
-        # to Indian Standard Time.
-        if dt.tzinfo is None:
-
-            dt = dt.replace(
-                tzinfo=timezone.utc
-            )
-
-        dt = dt.astimezone(
-            IST
-        )
-
-        end = (
-
-            dt
-            +
-            timedelta(
-                minutes=5
-            )
-        )
-
-        return (
-
-            dt.strftime(
-                "%H:%M"
-            )
-
-            +
-
-            "–"
-
-            +
-
-            end.strftime(
-                "%H:%M"
-            )
-        )
-
-    except Exception:
-
-        return ""
-
-
-# ============================================================
 # ANALYZE ONE STOCK
 # ============================================================
 
@@ -1397,81 +1987,166 @@ def analyze_stock(
 ):
 
     candles = get_5m_candles(
+
         row[
             "instrument_key"
         ]
     )
 
-    if len(candles) < 2:
+
+    if not candles:
 
         return None
 
-    # Upstox normally returns
-    # newest candle first.
-    #
-    # Reverse it so that:
-    # oldest -> newest
+
+    # Upstox returns newest candle first.
     candles = list(
         reversed(
             candles
         )
     )
 
-    # --------------------------------------------------------
-    # Current candle
-    # --------------------------------------------------------
 
-    current = candles[-1]
-
-    previous_for_current = (
-        candles[:-1]
+    now = datetime.now(
+        IST
     )
 
-    developing = (
-        shooting_star_score(
-            current,
-            previous_for_current
+
+    completed = []
+
+    developing_candle = None
+
+
+    for candle in candles:
+
+        if not candle:
+
+            continue
+
+
+        timestamp = candle[0]
+
+
+        if candle_completed(
+            timestamp,
+            now
+        ):
+
+            completed.append(
+                candle
+            )
+
+        else:
+
+            developing_candle = candle
+
+
+    actual_signals = []
+
+
+    # --------------------------------------------------------
+    # Scan ALL completed candles from today.
+    # --------------------------------------------------------
+
+    for index, candle in enumerate(
+        completed
+    ):
+
+
+        previous_candles = (
+            completed[:index]
         )
-    )
 
-    # --------------------------------------------------------
-    # Latest completed candle
-    # --------------------------------------------------------
 
-    completed = candles[-2]
+        result = shooting_star_score(
 
-    previous_for_completed = (
-        candles[:-2]
-    )
+            candle,
 
-    actual = (
-        shooting_star_score(
-            completed,
-            previous_for_completed
+            previous_candles
         )
-    )
+
+
+        if (
+
+            result["actual"]
+
+            and
+
+            result["score"]
+            >=
+            MIN_SCORE
+
+        ):
+
+
+            actual_signals.append({
+
+                "symbol":
+                    row["symbol"],
+
+                "price":
+                    row["price"],
+
+                "change":
+                    (
+                        (
+                            row["price"]
+                            -
+                            row["prev_close"]
+                        )
+                        /
+                        row["prev_close"]
+                    )
+                    *
+                    100,
+
+                "time":
+                    candle_time_label(
+                        candle[0]
+                    ),
+
+                "timestamp":
+                    candle[0],
+
+                "score":
+                    result["score"],
+
+                "avg_turnover":
+                    AVG_TURNOVER.get(
+                        row["symbol"],
+                        0.0
+                    )
+            })
+
 
     # --------------------------------------------------------
-    # Previous-close change
+    # Current developing candle
     # --------------------------------------------------------
 
-    change = (
+    developing_result = None
 
-        (
-            row["price"]
-            -
-            row["prev_close"]
-        )
-        /
-        row["prev_close"]
-    ) * 100
 
-    avg_turnover = (
-        AVG_TURNOVER.get(
-            row["symbol"],
-            0.0
+    if developing_candle:
+
+        index = len(
+            completed
         )
-    )
+
+
+        previous_candles = (
+            completed
+        )
+
+
+        developing_result = (
+            shooting_star_score(
+
+                developing_candle,
+
+                previous_candles
+            )
+        )
+
 
     return {
 
@@ -1482,42 +2157,163 @@ def analyze_stock(
             row["price"],
 
         "change":
-            change,
+            (
+                (
+                    row["price"]
+                    -
+                    row["prev_close"]
+                )
+                /
+                row["prev_close"]
+            )
+            *
+            100,
 
-        "avg_turnover":
-            avg_turnover,
+        "actual_signals":
+            actual_signals,
 
-        "developing": {
+        "developing":
 
-            "time":
-                candle_time_label(
-                    current[0]
-                ),
+            {
 
-            "score":
-                developing[
-                    "score"
-                ]
-        },
+                "time":
 
-        "actual": {
+                    (
+                        candle_time_label(
+                            developing_candle[0]
+                        )
 
-            "time":
-                candle_time_label(
-                    completed[0]
-                ),
+                        if
 
-            "score":
-                actual[
-                    "score"
-                ],
+                        developing_candle
 
-            "is_actual":
-                actual[
-                    "actual"
-                ]
-        }
+                        else
+
+                        ""
+                    ),
+
+                "score":
+
+                    (
+                        developing_result[
+                            "score"
+                        ]
+
+                        if
+
+                        developing_result
+
+                        else
+
+                        0.0
+                    )
+            }
     }
+
+
+# ============================================================
+# BUILD CANDIDATE UNIVERSE
+# ============================================================
+
+def build_candidates(
+    quotes
+):
+
+    candidates = []
+
+
+    for row in quotes:
+
+        avg_turnover = (
+
+            AVG_TURNOVER.get(
+                row["symbol"],
+                0.0
+            )
+        )
+
+
+        if avg_turnover < MIN_AVG_TURNOVER:
+
+            continue
+
+
+        candidates.append(
+            row
+        )
+
+
+    return candidates
+
+
+# ============================================================
+# ROTATING BATCH
+# ============================================================
+
+def get_rotating_batch(
+    candidates
+):
+
+    global BATCH_INDEX
+
+
+    total = len(
+        candidates
+    )
+
+
+    if total == 0:
+
+        return []
+
+
+    start = (
+
+        BATCH_INDEX
+        *
+        CANDLE_BATCH_SIZE
+    ) % total
+
+
+    if total <= CANDLE_BATCH_SIZE:
+
+        batch = candidates
+
+
+    else:
+
+        end = (
+
+            start
+            +
+            CANDLE_BATCH_SIZE
+        )
+
+
+        if end <= total:
+
+            batch = candidates[
+                start:end
+            ]
+
+        else:
+
+            batch = (
+
+                candidates[start:]
+
+                +
+
+                candidates[
+                    :end - total
+                ]
+            )
+
+
+    BATCH_INDEX += 1
+
+
+    return batch
 
 
 # ============================================================
@@ -1528,6 +2324,11 @@ def perform_scan():
 
     global LAST_SCAN_TIME
 
+    global LAST_BATCH_INFO
+
+    global TODAY_ACTUAL_SIGNALS
+
+
     if not TOKEN:
 
         raise RuntimeError(
@@ -1537,17 +2338,27 @@ def perform_scan():
             "में नहीं मिला।"
         )
 
+
     print(
         "Starting Shooting Star scan..."
     )
 
+
     # --------------------------------------------------------
-    # 1. LIVE QUOTES
+    # 1. Instruments
+    # --------------------------------------------------------
+
+    load_instruments()
+
+
+    # --------------------------------------------------------
+    # 2. Live quotes
     # --------------------------------------------------------
 
     quotes = (
         fetch_all_live_quotes()
     )
+
 
     if not quotes:
 
@@ -1556,100 +2367,89 @@ def perform_scan():
             "Upstox से live quotes नहीं मिले।"
         )
 
-    # --------------------------------------------------------
-    # 2. SYMBOL LIST
-    # --------------------------------------------------------
-
-    symbols = {
-
-        x["symbol"]
-
-        for x in quotes
-    }
 
     # --------------------------------------------------------
-    # 3. 20-DAY TURNOVER
-    #
-    # First scan may take longer because
-    # turnover cache must be created.
-    #
-    # Later scans use the cache.
+    # 3. Turnover cache
     # --------------------------------------------------------
 
     if not load_turnover_cache():
 
         build_turnover_cache(
-            symbols
+
+            {
+                x["symbol"]
+
+                for x in quotes
+            }
         )
 
+
     # --------------------------------------------------------
-    # 4. FINAL UNIVERSE
-    #
-    # NSE EQ
-    # Price >= ₹100
-    # Average turnover >= ₹10 Cr
+    # 4. Liquidity universe
     # --------------------------------------------------------
 
-    candidates = [
+    candidates = build_candidates(
+        quotes
+    )
 
-        x
 
-        for x in quotes
+    if not candidates:
 
-        if AVG_TURNOVER.get(
-            x["symbol"],
-            0.0
+        raise RuntimeError(
+
+            "₹5 Crore liquidity condition "
+            "पूरी करने वाले stocks नहीं मिले।"
         )
-        >=
-        MIN_AVG_TURNOVER
-    ]
+
+
+    # --------------------------------------------------------
+    # 5. Rotating 450-stock batch
+    # --------------------------------------------------------
+
+    batch = get_rotating_batch(
+        candidates
+    )
+
+
+    LAST_BATCH_INFO = (
+
+        "This scan: "
+
+        +
+
+        str(
+            len(batch)
+        )
+
+        +
+
+        " stocks • "
+
+        +
+
+        str(
+            len(candidates)
+        )
+
+        +
+
+        " liquid stocks universe"
+    )
+
 
     print(
-        "Final liquidity universe:",
-        len(candidates)
+        LAST_BATCH_INFO
     )
 
-    # --------------------------------------------------------
-    # 5. SPEED OPTIMIZATION
-    #
-    # Process the strongest current gainers first.
-    # This is only a request-order optimization.
-    # It does NOT change the final Shooting Star score.
-    # --------------------------------------------------------
-
-    candidates.sort(
-
-        key=lambda x:
-
-            (
-                (
-                    x["price"]
-                    -
-                    x["prev_close"]
-                )
-                /
-                x["prev_close"]
-            ),
-
-        reverse=True
-    )
-
-    candidates = candidates[
-        :MAX_INTRADAY_STOCKS
-    ]
-
-    print(
-        "Intraday candle candidates:",
-        len(candidates)
-    )
 
     # --------------------------------------------------------
-    # 6. 5-MINUTE CANDLE ANALYSIS
+    # 6. 5-minute candle analysis
     # --------------------------------------------------------
 
     developing = []
 
-    actual = []
+    new_actual = []
+
 
     with ThreadPoolExecutor(
 
@@ -1658,19 +2458,24 @@ def perform_scan():
 
     ) as executor:
 
+
         futures = [
 
             executor.submit(
+
                 analyze_stock,
+
                 row
             )
 
-            for row in candidates
+            for row in batch
         ]
+
 
         for future in as_completed(
             futures
         ):
+
 
             try:
 
@@ -1678,12 +2483,14 @@ def perform_scan():
                     future.result()
                 )
 
+
                 if not result:
 
                     continue
 
+
                 # ------------------------------------------------
-                # DEVELOPING
+                # Developing
                 # ------------------------------------------------
 
                 if (
@@ -1697,40 +2504,83 @@ def perform_scan():
                     >=
 
                     MIN_SCORE
+
                 ):
 
-                    developing.append(
-                        result
-                    )
+                    developing.append({
+
+                        "symbol":
+                            result[
+                                "symbol"
+                            ],
+
+                        "price":
+                            result[
+                                "price"
+                            ],
+
+                        "change":
+                            result[
+                                "change"
+                            ],
+
+                        "time":
+                            result[
+                                "developing"
+                            ][
+                                "time"
+                            ],
+
+                        "score":
+                            result[
+                                "developing"
+                            ][
+                                "score"
+                            ],
+
+                        "status":
+                            "Developing"
+                    })
+
 
                 # ------------------------------------------------
-                # ACTUAL
+                # Actual
                 # ------------------------------------------------
 
-                if (
+                for signal in result[
+                    "actual_signals"
+                ]:
 
-                    result[
-                        "actual"
-                    ][
-                        "is_actual"
-                    ]
 
-                    and
+                    signal_key = (
 
-                    result[
-                        "actual"
-                    ][
-                        "score"
-                    ]
+                        signal[
+                            "symbol"
+                        ]
 
-                    >=
+                        +
 
-                    MIN_SCORE
-                ):
+                        "|"
 
-                    actual.append(
-                        result
+                        +
+
+                        signal[
+                            "timestamp"
+                        ]
                     )
+
+
+                    if signal_key not in TODAY_ACTUAL_SIGNALS:
+
+                        TODAY_ACTUAL_SIGNALS[
+                            signal_key
+                        ] = signal
+
+
+                        new_actual.append(
+                            signal
+                        )
+
 
             except Exception as e:
 
@@ -1739,31 +2589,35 @@ def perform_scan():
                     repr(e)
                 )
 
-    # ========================================================
-    # DEVELOPING RANK
-    # ========================================================
+
+    # --------------------------------------------------------
+    # Developing ranking
+    # --------------------------------------------------------
 
     developing.sort(
 
         key=lambda x:
 
             x[
-                "developing"
-            ][
                 "score"
             ],
 
         reverse=True
     )
 
+
     developing_rows = []
+
 
     for i, x in enumerate(
 
-        developing,
+        developing[
+            :MAX_DEVELOPING_DISPLAY
+        ],
 
         start=1
     ):
+
 
         developing_rows.append({
 
@@ -1771,57 +2625,87 @@ def perform_scan():
                 i,
 
             "symbol":
-                x["symbol"],
+                x[
+                    "symbol"
+                ],
 
             "price":
-                x["price"],
+                round(
+                    x[
+                        "price"
+                    ],
+                    2
+                ),
 
             "change":
-                x["change"],
+                round(
+                    x[
+                        "change"
+                    ],
+                    2
+                ),
 
             "time":
                 x[
-                    "developing"
-                ][
                     "time"
                 ],
 
             "score":
-                x[
-                    "developing"
-                ][
-                    "score"
-                ],
+                round(
+                    x[
+                        "score"
+                    ],
+                    1
+                ),
 
             "status":
                 "Developing"
         })
 
-    # ========================================================
-    # ACTUAL RANK
-    # ========================================================
 
-    actual.sort(
+    # --------------------------------------------------------
+    # Actual ranking
+    # --------------------------------------------------------
+
+    actual_all = list(
+        TODAY_ACTUAL_SIGNALS.values()
+    )
+
+
+    actual_all.sort(
 
         key=lambda x:
 
-            x[
-                "actual"
-            ][
-                "score"
-            ],
+            (
+                -float(
+                    x[
+                        "score"
+                    ]
+                ),
 
-        reverse=True
+                x[
+                    "symbol"
+                ],
+
+                x[
+                    "timestamp"
+                ]
+            )
     )
+
 
     actual_rows = []
 
+
     for i, x in enumerate(
 
-        actual,
+        actual_all[
+            :MAX_ACTUAL_DISPLAY
+        ],
 
         start=1
     ):
+
 
         actual_rows.append({
 
@@ -1829,35 +2713,57 @@ def perform_scan():
                 i,
 
             "symbol":
-                x["symbol"],
+                x[
+                    "symbol"
+                ],
 
             "price":
-                x["price"],
+                round(
+                    x[
+                        "price"
+                    ],
+                    2
+                ),
 
             "change":
-                x["change"],
+                round(
+                    x[
+                        "change"
+                    ],
+                    2
+                ),
 
             "time":
                 x[
-                    "actual"
-                ][
                     "time"
                 ],
 
             "score":
-                x[
-                    "actual"
-                ][
-                    "score"
-                ],
+                round(
+                    x[
+                        "score"
+                    ],
+                    1
+                ),
 
             "status":
                 "Actual"
         })
 
-    # ========================================================
-    # SCAN COMPLETE TIME — INDIA / IST
-    # ========================================================
+
+    # --------------------------------------------------------
+    # Save results
+    # --------------------------------------------------------
+
+    LIVE_RESULTS = {
+
+        "developing":
+            developing_rows,
+
+        "actual":
+            actual_rows
+    }
+
 
     LAST_SCAN_TIME = (
 
@@ -1868,28 +2774,28 @@ def perform_scan():
         )
     )
 
-    print(
-        "Developing results:",
-        len(developing_rows)
-    )
 
     print(
-        "Actual results:",
-        len(actual_rows)
+        "Developing:",
+        len(
+            developing_rows
+        )
     )
 
-    return {
 
-        "developing":
-            developing_rows,
-
-        "actual":
+    print(
+        "Actual today:",
+        len(
             actual_rows
-    }
+        )
+    )
+
+
+    return LIVE_RESULTS
 
 
 # ============================================================
-# BACKGROUND SCAN
+# BACKGROUND SCAN WORKER
 # ============================================================
 
 def scan_worker():
@@ -1900,6 +2806,7 @@ def scan_worker():
 
     global LAST_ERROR
 
+
     try:
 
         LIVE_RESULTS = (
@@ -1908,23 +2815,32 @@ def scan_worker():
 
         LAST_ERROR = ""
 
+
     except Exception as e:
 
-        LAST_ERROR = repr(e)
+        LAST_ERROR = repr(
+            e
+        )
 
         print(
             "SCAN ERROR:",
             repr(e)
         )
 
+
     finally:
 
         SCAN_RUNNING = False
 
 
+# ============================================================
+# START ONE SCAN
+# ============================================================
+
 def start_scan():
 
     global SCAN_RUNNING
+
 
     with SCAN_LOCK:
 
@@ -1932,7 +2848,9 @@ def start_scan():
 
             return False
 
+
         SCAN_RUNNING = True
+
 
     threading.Thread(
 
@@ -1942,7 +2860,59 @@ def start_scan():
 
     ).start()
 
+
     return True
+
+
+# ============================================================
+# AUTOMATIC BACKGROUND SCANNER
+# ============================================================
+
+def background_loop():
+
+    global BACKGROUND_RUNNING
+
+
+    if BACKGROUND_RUNNING:
+
+        return
+
+
+    BACKGROUND_RUNNING = True
+
+
+    print(
+        "Background scanner started."
+    )
+
+
+    while True:
+
+
+        try:
+
+            if market_open_now():
+
+                if not SCAN_RUNNING:
+
+                    start_scan()
+
+
+            time.sleep(
+                SCAN_INTERVAL_SECONDS
+            )
+
+
+        except Exception as e:
+
+            print(
+                "Background loop error:",
+                repr(e)
+            )
+
+            time.sleep(
+                SCAN_INTERVAL_SECONDS
+            )
 
 
 # ============================================================
@@ -2024,6 +2994,7 @@ button:active{
     margin-top:7px;
     color:#c3ccd6;
     font-size:12px;
+    line-height:1.5;
 }
 
 .section{
@@ -2047,12 +3018,12 @@ table{
 
 th{
     background:#252c35;
-    padding:5px 4px;
+    padding:6px 4px;
     white-space:nowrap;
 }
 
 td{
-    padding:5px 4px;
+    padding:6px 4px;
     border-bottom:1px solid #2c333c;
     text-align:center;
     white-space:nowrap;
@@ -2080,7 +3051,7 @@ td{
 .note{
     color:#8e98a4;
     font-size:11px;
-    line-height:1.45;
+    line-height:1.5;
 }
 
 </style>
@@ -2095,13 +3066,13 @@ td{
 <div class="card">
 
 <h1>
-Actual Shooting Star Rank Scanner
+⭐ Shooting Star Rank Scanner
 </h1>
 
 <div class="subtitle">
 
 NSE EQ • ₹100+ •
-20D Avg Turnover ≥ ₹10 Cr •
+20D Avg Turnover ≥ ₹5 Cr •
 5-Minute
 
 </div>
@@ -2113,7 +3084,7 @@ SCAN NOW
 <div id="status"
      class="status">
 
-Ready
+Scanner ready
 
 </div>
 
@@ -2168,7 +3139,7 @@ Ready
 <div class="card">
 
 <div class="section">
-🟢 ACTUAL SHOOTING STAR
+🟢 ACTUAL SHOOTING STAR — TODAY
 </div>
 
 <div class="table-wrap">
@@ -2212,24 +3183,22 @@ NSE Equity EQ only<br>
 
 Price ≥ ₹100<br>
 
-20-Day Average Turnover ≥ ₹10 Crore<br>
-
-Change % = Previous Close के मुकाबले<br><br>
-
-<b>Developing</b> =
-current 5-minute candle की live structure।<br>
+20-Day Average Turnover ≥ ₹5 Crore<br><br>
 
 <b>Actual</b> =
-latest completed 5-minute candle जो
-Shooting Star के निर्धारित structural criteria
-पूरे करती है।<br><br>
+आज की सभी completed 5-minute candles में
+बना हुआ qualifying Shooting Star।<br><br>
 
-Actual Shooting Star के लिए
-अगली confirmation candle जरूरी नहीं है।<br><br>
+<b>SS Time</b> =
+जिस 5-minute candle में Shooting Star बना,
+उसका समय।<br><br>
 
-Developing Score probability नहीं है।
-यह current candle की Shooting Star
-structure quality को 0–100 में बताता है।
+<b>Developing</b> =
+वर्तमान चल रही 5-minute candle की structure।<br><br>
+
+अलग-अलग scans में अलग NSE EQ batches
+scan होते हैं और आज मिले Actual signals
+एक ही दिन की list में जमा होते रहते हैं।
 
 </div>
 
@@ -2238,115 +3207,6 @@ structure quality को 0–100 में बताता है।
 
 
 <script>
-
-
-async function runScan(){
-
-    const status =
-        document.getElementById(
-            "status"
-        );
-
-    status.innerText =
-        "Scanner शुरू हो रहा है...";
-
-    try{
-
-        await fetch(
-            "/api/start"
-        );
-
-        poll();
-
-    }catch(e){
-
-        status.innerText =
-            "Scanner start error";
-
-    }
-
-}
-
-
-async function poll(){
-
-    try{
-
-        const r =
-            await fetch(
-                "/api/results"
-            );
-
-        const data =
-            await r.json();
-
-        const status =
-            document.getElementById(
-                "status"
-            );
-
-
-        if(data.running){
-
-            status.innerText =
-                "Live quotes और 5-minute candles scan हो रहे हैं...";
-
-            setTimeout(
-                poll,
-                800
-            );
-
-            return;
-
-        }
-
-
-        if(data.error){
-
-            status.innerText =
-                "Error: " +
-                data.error;
-
-            return;
-
-        }
-
-
-        status.innerText =
-            "Scan complete • " +
-            data.updated_at;
-
-
-        drawRows(
-
-            "developingRows",
-
-            data.results.developing,
-
-            "dev-row"
-        );
-
-
-        drawRows(
-
-            "actualRows",
-
-            data.results.actual,
-
-            "actual-row"
-        );
-
-
-    }catch(e){
-
-        setTimeout(
-            poll,
-            1500
-        );
-
-    }
-
-}
 
 
 function drawRows(
@@ -2372,7 +3232,7 @@ function drawRows(
             "<tr>" +
             "<td colspan='7' " +
             "class='empty'>" +
-            "इस समय कोई qualifying result नहीं मिला" +
+            "अभी कोई qualifying result नहीं मिला" +
             "</td>" +
             "</tr>";
 
@@ -2388,6 +3248,7 @@ function drawRows(
                 document.createElement(
                     "tr"
                 );
+
 
             tr.className =
                 rowClass;
@@ -2440,6 +3301,151 @@ function drawRows(
 }
 
 
+async function loadResults(){
+
+    try{
+
+        const r =
+            await fetch(
+                "/api/results?ts=" +
+                Date.now()
+            );
+
+
+        const data =
+            await r.json();
+
+
+        const status =
+            document.getElementById(
+                "status"
+            );
+
+
+        if(data.error){
+
+            status.innerText =
+                "⚠ " +
+                data.error;
+
+        }
+
+
+        else if(data.running){
+
+            status.innerText =
+                "Scanner चल रहा है...";
+
+        }
+
+
+        else{
+
+            status.innerText =
+
+                "Last scan: " +
+                (data.updated_at || "-")
+
+                +
+
+                " • "
+
+                +
+
+                (data.batch_info || "")
+
+                +
+
+                " • "
+
+                +
+
+                "Today's Actual: " +
+
+                (
+                    data.results.actual
+                    || []
+                ).length;
+        }
+
+
+        drawRows(
+
+            "developingRows",
+
+            data.results.developing,
+
+            "dev-row"
+        );
+
+
+        drawRows(
+
+            "actualRows",
+
+            data.results.actual,
+
+            "actual-row"
+        );
+
+
+    }
+
+    catch(e){
+
+        document.getElementById(
+            "status"
+        ).innerText =
+            "Connection problem";
+
+    }
+
+}
+
+
+async function runScan(){
+
+    const status =
+        document.getElementById(
+            "status"
+        );
+
+
+    status.innerText =
+        "Scanner शुरू हो रहा है...";
+
+
+    try{
+
+        await fetch(
+            "/api/start"
+        );
+
+
+        loadResults();
+
+
+    }
+
+    catch(e){
+
+        status.innerText =
+            "Scanner start error";
+
+    }
+
+}
+
+
+loadResults();
+
+
+setInterval(
+    loadResults,
+    5000
+);
+
+
 </script>
 
 </body>
@@ -2464,6 +3470,7 @@ def home():
 def api_start():
 
     started = start_scan()
+
 
     return jsonify({
 
@@ -2491,6 +3498,9 @@ def api_results():
         "updated_at":
             LAST_SCAN_TIME,
 
+        "batch_info":
+            LAST_BATCH_INFO,
+
         "results":
             LIVE_RESULTS
     })
@@ -2510,16 +3520,31 @@ def health():
             bool(TOKEN),
 
         "nse_eq_stocks":
-            len(INSTRUMENTS),
+            len(
+                INSTRUMENTS
+            ),
+
+        "liquid_stocks":
+            len(
+                AVG_TURNOVER
+            ),
 
         "scan_running":
             SCAN_RUNNING,
+
+        "background_running":
+            BACKGROUND_RUNNING,
 
         "last_scan":
             LAST_SCAN_TIME,
 
         "last_error":
-            LAST_ERROR
+            LAST_ERROR,
+
+        "today_actual_signals":
+            len(
+                TODAY_ACTUAL_SIGNALS
+            )
     })
 
 
@@ -2529,11 +3554,25 @@ def health():
 
 if __name__ == "__main__":
 
+
+    # Start automatic market scanner.
+    threading.Thread(
+
+        target=background_loop,
+
+        daemon=True,
+
+        name="shooting-star-background"
+
+    ).start()
+
+
     app.run(
 
         host="0.0.0.0",
 
         port=int(
+
             os.getenv(
                 "PORT",
                 "5000"
